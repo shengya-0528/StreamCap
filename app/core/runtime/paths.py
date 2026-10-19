@@ -63,7 +63,10 @@ def prepare_user_data_dir() -> None:
 
 
 def prepare_bundled_ffmpeg() -> None:
-    source_executable = resource_dir / "ffmpeg" / f"ffmpeg{EXECUTABLE_SUFFIX}"
+    # ffmpeg 打包后在 _EXECUTABLE_DIR 同级目录，不是在 resource_dir(_internal) 下
+    source_executable = _EXECUTABLE_DIR / "ffmpeg" / f"ffmpeg{EXECUTABLE_SUFFIX}"
+    if not source_executable.is_file():
+        source_executable = resource_dir / "ffmpeg" / f"ffmpeg{EXECUTABLE_SUFFIX}"
     target_dir = user_data_dir / "ffmpeg"
     target_executable = target_dir / f"ffmpeg{EXECUTABLE_SUFFIX}"
     if not source_executable.is_file() or target_executable.exists():
@@ -78,7 +81,10 @@ def prepare_bundled_ffmpeg() -> None:
 
 
 def prepare_bundled_node() -> None:
-    source_executable = resource_dir / "node" / f"node{EXECUTABLE_SUFFIX}"
+    # node 打包后在 _EXECUTABLE_DIR 同级目录
+    source_executable = _EXECUTABLE_DIR / "node" / f"node{EXECUTABLE_SUFFIX}"
+    if not source_executable.is_file():
+        source_executable = resource_dir / "node" / f"node{EXECUTABLE_SUFFIX}"
     target_dir = user_data_dir / "node"
     target_executable = target_dir / f"node{EXECUTABLE_SUFFIX}"
     if not source_executable.is_file() or target_executable.exists():
