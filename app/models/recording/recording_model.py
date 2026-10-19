@@ -86,6 +86,9 @@ class Recording:
         self.use_proxy = None
         self.record_url = None
         self.preview_url = None
+        self.fluctuation_retry_count: int | None = None
+        self.fluctuation_cumulative_wait: int | None = None
+        self.fluctuation_cooldown_end_time: float | None = None
 
     def to_dict(self):
         """Convert the Recording instance to a dictionary for saving."""
@@ -108,6 +111,9 @@ class Recording:
             "only_notify_no_record": self.only_notify_no_record,
             "flv_use_direct_download": self.flv_use_direct_download,
             "video_bitrate": self.video_bitrate,
+            "fluctuation_retry_count": self.fluctuation_retry_count,
+            "fluctuation_cumulative_wait": self.fluctuation_cumulative_wait,
+            "fluctuation_cooldown_end_time": self.fluctuation_cooldown_end_time,
         }
 
     @classmethod
@@ -138,6 +144,7 @@ class Recording:
         recording.platform_key = data.get("platform_key")
         if recording.last_duration_str is not None:
             recording.last_duration = timedelta(seconds=float(recording.last_duration_str))
+        recording.fluctuation_cooldown_end_time = data.get("fluctuation_cooldown_end_time")
         return recording
 
     def update_title(self, quality_info, prefix=None):

@@ -413,6 +413,14 @@ class SettingsPage(PageBase):
                             ),
                         ),
                         self.create_setting_row(
+                            self._["fluctuation_detection_enabled"],
+                            ft.Switch(
+                                value=self.get_config_value("fluctuation_detection_enabled", False),
+                                data="fluctuation_detection_enabled",
+                                on_change=self.on_change,
+                            ),
+                        ),
+                        self.create_setting_row(
                             self._["is_segmented_recording_enabled"],
                             ft.Switch(
                                 value=self.get_config_value("segmented_recording_enabled"),

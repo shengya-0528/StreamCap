@@ -2,6 +2,7 @@ import asyncio
 import threading
 from collections import defaultdict
 from datetime import datetime, timedelta
+import time
 
 from ...messages import desktop_notify, message_pusher
 from ...models.recording.recording_model import Recording
@@ -10,6 +11,7 @@ from ...utils import utils
 from ...utils.logger import logger
 from ..platforms.platform_handlers import get_platform_info
 from ..runtime.process_manager import BackgroundService
+from .fluctuation_detector import FluctuationDetector, FluctuationMode
 from .stream_manager import LiveStreamRecorder
 
 
@@ -32,6 +34,8 @@ class RecordingManager:
         max_concurrent = int(self.settings.user_config.get("platform_max_concurrent_requests", 3))
         self.platform_semaphores = defaultdict(lambda: asyncio.Semaphore(max_concurrent))
         self.active_recorders = {}
+        self.fluctuation_detectors = {}
+        self.fluctuation_detector = FluctuationDetector(loop_time_seconds=self.loop_time_seconds)
 
     @property
     def app(self):
@@ -66,6 +70,45 @@ class RecordingManager:
             recording.loop_time_seconds = self.loop_time_seconds
             recording.update_title(self._.get(recording.quality, recording.quality))
             recording.showed_checking_status = True
+
+    def _init_fluctuation_detector(self, recording: Recording):
+        """初始化或恢复某个录制任务对应的波动检测器。"""
+        if recording.rec_id not in self.fluctuation_detectors:
+            self.fluctuation_detectors[recording.rec_id] = FluctuationDetector(
+                loop_time_seconds=self.loop_time_seconds
+            )
+        det = self.fluctuation_detectors[recording.rec_id]
+        saved = getattr(recording, "fluctuation_retry_count", None)
+        cumulative = getattr(recording, "fluctuation_cumulative_wait", None)
+        if saved is not None:
+            det.current_retry = saved
+            det.cumulative_wait = cumulative
+
+    def _is_in_fluctuation_cooldown(self, recording: Recording) -> bool:
+        """检查是否处于波动检测后的 7 分钟冷却期。"""
+        cooldown_end = getattr(recording, "fluctuation_cooldown_end_time", None)
+        if cooldown_end is None:
+            return False
+        return datetime.now().timestamp() < cooldown_end
+
+    def _on_stream_offline(self, recording: Recording):
+        """流掉线入口：按节奏表启动波动检测。"""
+        if not self.settings.user_config.get("fluctuation_detection_enabled", False):
+            return
+        # 冷却期未过，跳过波动检测
+        if self._is_in_fluctuation_cooldown(recording):
+            return
+        det = self._init_fluctuation_detector(recording)
+        if det.is_in_fluctuation():
+            det.reset()
+        det.next_retry()
+        recording.fluctuation_retry_count = det.current_retry
+        recording.fluctuation_cumulative_wait = det.cumulative_wait
+
+        # 确认下播或达到最大重试，进入冷却期
+        if det.should_confirm_down() or det.should_give_up():
+            recording.fluctuation_cooldown_end_time = time.time() + 7 * 60
+            det.reset()
 
     async def add_recording(self, recording):
         with GlobalRecordingState.lock:
@@ -412,6 +455,8 @@ class RecordingManager:
                 asyncio.create_task(recorder.end_message_push())
 
             recording.status_info = RecordingStatus.MONITORING
+            # 波动检测掉线入口
+            self._on_stream_offline(recording)
             title = f"{stream_info.anchor_name or recording.streamer_name} - {self._[recording.quality]}"
             if recording.streamer_name == self._["live_room"] or f"[{self._['is_live']}]" in recording.display_title:
                 recording.update(

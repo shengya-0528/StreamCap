@@ -253,6 +253,7 @@
     "video_record_format": "Video/Audio Recording Format",
     "recording_quality": "Recording Quality",
     "loop_time": "Loop Time (Seconds)",
+    "fluctuation_detection_enabled": "Enable Fluctuation Detection",
     "is_segmented_recording_enabled": "Enable Segmented Recording",
     "force_https": "Force HTTPS Recording",
     "default_live_source": "Default Live Source",

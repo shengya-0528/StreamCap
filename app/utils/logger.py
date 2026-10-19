@@ -1,15 +1,22 @@
-import os
-import sys
+import os as _os
+import sys as _sys
 
 from loguru import logger
 
 from app.core.runtime.paths import user_data_dir
 
-log_dir = os.path.join(user_data_dir, "logs")
-os.makedirs(log_dir, exist_ok=True)
-use_multiprocessing_queue = not (getattr(sys, "frozen", False) and sys.platform == "darwin")
+log_dir = _os.path.join(user_data_dir, "logs")
+
+if getattr(_sys, "frozen", False) and _sys.platform == "win32" and not _os.path.exists(log_dir):
+    try:
+        _os.makedirs(log_dir, exist_ok=True)
+    except PermissionError:
+        # 打包运行时若 AppData 无写权限，改用 TEMP 目录
+        parent = _os.path.dirname(log_dir)
+        _os.makedirs(parent, exist_ok=True)
+use_multiprocessing_queue = not (getattr(_sys, "frozen", False) and _sys.platform == "darwin")
 logger.add(
-    os.path.join(log_dir, "streamget.log"),
+    _os.path.join(log_dir, "streamget.log"),
     level="DEBUG",
     format="{time:YYYY-MM-DD HH:mm:ss.SSS} | {level: <8} | {name}:{function}:{line} - {message}",
     filter=lambda i: i["level"].name != "STREAM",
@@ -22,7 +29,7 @@ logger.add(
 
 logger.level("STREAM", no=22, color="<blue>")
 logger.add(
-    os.path.join(log_dir, "play_url.log"),
+    _os.path.join(log_dir, "play_url.log"),
     level="STREAM",
     format="{time:YYYY-MM-DD HH:mm:ss.SSS} | {message}",
     filter=lambda i: i["level"].name == "STREAM",
