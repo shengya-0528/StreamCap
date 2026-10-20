@@ -17,6 +17,7 @@ from .video_player import VideoPlayer
 class RecordingCardManager:
     def __init__(self, app):
         self.app = app
+        self._seen_values = {}
         self.cards_obj = {}
         self.update_duration_tasks = {}
         self.selected_cards = {}
@@ -50,7 +51,7 @@ class RecordingCardManager:
 
     def _create_card_components(self, recording: Recording):
         """create card components."""
-        speed = recording.speed
+        speed_text = self.get_speed_text(recording)
         duration_text_label = ft.Text(self.app.record_manager.get_duration(recording), size=12)
 
         record_button = ft.IconButton(
@@ -112,14 +113,34 @@ class RecordingCardManager:
             tooltip=self._["recording_info"],
             on_click=lambda e, rec=recording: self.app.page.run_task(self.recording_info_button_on_click, e, rec),
         )
-        speed_text_label = ft.Text(speed, size=12)
+        speed_text_label = ft.Text(speed_text, size=12)
+        size_text_label = ft.Text(self.get_size_text(recording), size=12, color="#999999")
 
         status_label = self.create_status_label(recording)
 
+        resolution_label = ft.Text(recording.video_resolution or "-", size=12, color="#999999")
+        fps_label = ft.Text(self.get_fps_text(recording), size=12, color="#999999")
+        bitrate_label = ft.Text(self.get_bitrate_text(recording), size=12, color="#999999")
+
+        # 第一行：标题 ---- 录制状态
         title_row = ft.Row(
             [display_title_label, status_label] if status_label else [display_title_label],
             alignment=ft.MainAxisAlignment.START,
             spacing=5,
+            tight=True,
+        )
+        # 第二行：录制时间 ---- 文件大小 ---- 分辨率
+        meta_row = ft.Row(
+            [duration_text_label, size_text_label, resolution_label],
+            alignment=ft.MainAxisAlignment.START,
+            spacing=8,
+            tight=True,
+        )
+        # 第三行：写入速率 ---- 帧率 ---- 码率
+        stats_row = ft.Row(
+            [speed_text_label, fps_label, bitrate_label],
+            alignment=ft.MainAxisAlignment.START,
+            spacing=8,
             tight=True,
         )
 
@@ -127,8 +148,8 @@ class RecordingCardManager:
             content=ft.Column(
                 [
                     title_row,
-                    duration_text_label,
-                    speed_text_label,
+                    meta_row,
+                    stats_row,
                     ft.Row(
                         [
                             record_button,
@@ -160,13 +181,68 @@ class RecordingCardManager:
             "display_title_label": display_title_label,
             "duration_label": duration_text_label,
             "speed_label": speed_text_label,
+            "size_label": size_text_label,
             "record_button": record_button,
             "open_folder_button": open_folder_button,
             "recording_info_button": recording_info_button,
             "edit_button": edit_button,
             "monitor_button": monitor_button,
             "status_label": status_label,
+            "resolution_label": resolution_label,
+            "fps_label": fps_label,
+            "bitrate_label": bitrate_label,
         }
+
+    def get_speed_text(self, recording: Recording) -> str:
+        """最近若干次采样的平均写入速度（KB/s）；取不到实时统计时用录制对象缓存值兜底。"""
+        speeds: list[float] = []
+        try:
+            recorder = getattr(self.app.record_manager, "active_recorders", {}).get(recording.rec_id)
+            stats = getattr(recorder, "_stream_stats", None) or getattr(self.app.record_manager, "_stream_stats", None)
+            raw = getattr(stats, "last_write_speeds", None)
+            if raw is None and isinstance(stats, dict):
+                raw = stats.get("last_write_speeds")
+            speeds = [float(value) for value in (raw or []) if isinstance(value, (int, float))]
+        except Exception:
+            speeds = []
+        if speeds:
+            return f"{round(sum(speeds) / len(speeds), 1)} KB/s"
+        cached = getattr(recording, "speed", 0)
+        if isinstance(cached, str) and cached:
+            return cached
+        if isinstance(cached, (int, float)) and cached > 0:
+            return f"{round(float(cached), 1)} KB/s"
+        return "0 KB/s"
+
+    @staticmethod
+    def get_size_text(recording: Recording) -> str:
+        """已写入文件大小：不足 1 GB 用 MB，达到 1 GB 用 GB 并保留一位小数。"""
+        size = getattr(recording, "current_file_size", 0) or 0
+        try:
+            size = float(size)
+        except (TypeError, ValueError):
+            size = 0.0
+        if size >= 1024 ** 3:
+            return f"{size / 1024 ** 3:.1f} GB"
+        return f"{round(size / 1024 ** 2)} MB"
+
+    @staticmethod
+    def get_fps_text(recording: Recording) -> str:
+        fps = getattr(recording, "video_fps", 0) or 0
+        try:
+            fps = float(fps)
+        except (TypeError, ValueError):
+            fps = 0.0
+        return f"{fps:g} fps" if fps > 0 else "0 fps"
+
+    @staticmethod
+    def get_bitrate_text(recording: Recording) -> str:
+        bitrate = getattr(recording, "source_bitrate", 0) or 0
+        try:
+            bitrate = int(float(bitrate))
+        except (TypeError, ValueError):
+            bitrate = 0
+        return f"{bitrate} kbps" if bitrate > 0 else "0 kbps"
 
     def get_card_background_color(self, recording: Recording):
         is_dark_mode = self.app.page.theme_mode == ft.ThemeMode.DARK
@@ -214,20 +290,34 @@ class RecordingCardManager:
                     title_row.tight = True
 
                     # Update the status label if it exists
-                    if new_status_label:
-                        if len(title_row.controls) > 1:
-                            title_row.controls[1] = new_status_label
-                        else:
-                            title_row.controls.append(new_status_label)
-                    else:
-                        if len(title_row.controls) > 1:
-                            title_row.controls.pop()
+                    if len(title_row.controls) > 1:
+                        title_row.controls[1] = new_status_label if new_status_label else ft.Container(width=0)
+                    elif new_status_label:
+                        title_row.controls.append(new_status_label)
 
                 if recording_card.get("duration_label"):
                     recording_card["duration_label"].value = self.app.record_manager.get_duration(recording)
 
                 if recording_card.get("speed_label"):
-                    recording_card["speed_label"].value = recording.speed
+                    recording_card["speed_label"].value = self.get_speed_text(recording)
+                if recording_card.get("size_label"):
+                    recording_card["size_label"].value = self.get_size_text(recording)
+
+                # update res/fps/bitrate
+                if recording_card.get("resolution_label"):
+                    recording_card["resolution_label"].value = str(recording.video_resolution or "-")
+                if recording_card.get("fps_label"):
+                    recording_card["fps_label"].value = self.get_fps_text(recording)
+                if recording_card.get("bitrate_label"):
+                    recording_card["bitrate_label"].value = self.get_bitrate_text(recording)
+                if recording_card.get("resolution_label"):
+                    values = (recording_card["resolution_label"].value, recording_card["fps_label"].value,
+                              recording_card["bitrate_label"].value, recording_card["speed_label"].value,
+                              recording_card["size_label"].value)
+                    seen = self._seen_values.setdefault(recording.rec_id, None)
+                    if seen != values:
+                        self._seen_values[recording.rec_id] = values
+                        logger.debug(f"[CARD-VALUES] {recording.streamer_name} -> " + " | ".join(values))
 
                 if recording_card.get("record_button"):
                     recording_card["record_button"].icon = self.get_icon_for_recording_state(recording)

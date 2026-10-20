@@ -1,10 +1,14 @@
 import asyncio
 import os
+import re
 import shutil
 import subprocess
 import sys
 import time
+import urllib.parse
+import urllib.request
 from datetime import datetime
+from types import SimpleNamespace
 from typing import TypeVar
 
 from ...messages import desktop_notify, message_pusher
@@ -256,9 +260,9 @@ class LiveStreamRecorder:
         return stream_info
 
     async def start_recording(self, stream_info: StreamData):
-        """
-        Construct ffmpeg recording parameters and start recording
-        """
+        self._stats_source_url = (getattr(stream_info, "m3u8_url", None)
+                                  or getattr(stream_info, "record_url", None) or "")
+        """Construct ffmpeg recording parameters and start recording"""
 
         self.save_format, use_direct_download = self._get_record_format(stream_info)
         filename = self._get_filename(stream_info)
@@ -273,11 +277,8 @@ class LiveStreamRecorder:
         try:
             if self.recording.rec_id in self.services.recording_manager.active_recorders:
                 old_recorder = self.services.recording_manager.active_recorders[self.recording.rec_id]
-                logger.warning(
-                    f"Found existing recorder instance for {self.recording.rec_id}, id: {id(old_recorder)}, stopping it"
-                )
+                logger.warning(f"Found existing recorder instance for {self.recording.rec_id}, id: {id(old_recorder)}, stopping it")
                 old_recorder.request_stop()
-
                 await asyncio.sleep(1)
 
             self.services.recording_manager.active_recorders[self.recording.rec_id] = self
@@ -341,7 +342,6 @@ class LiveStreamRecorder:
 
     async def recheck_live_status(self):
         if not self.should_stop:
-            # not manually stopped
             recording_duration = time.time() - self.recording_start_time
             if recording_duration > self.min_valid_recording_duration:
                 if self.services.recording_enabled and not self.is_flv_preferred_platform:
@@ -350,14 +350,9 @@ class LiveStreamRecorder:
                 self.recording.status_info = RecordingStatus.RECORDING_ERROR
 
     @staticmethod
-    async def _capture_stream_tail(
-        stream: asyncio.StreamReader | None,
-        max_bytes: int = 64 * 1024,
-    ) -> bytes:
-        """Continuously drain a subprocess stream while retaining a bounded tail."""
+    async def _capture_stream_tail(stream, max_bytes: int = 64 * 1024) -> bytes:
         if stream is None or max_bytes <= 0:
             return b""
-
         tail = bytearray()
         while chunk := await stream.read(4096):
             tail.extend(chunk)
@@ -374,9 +369,7 @@ class LiveStreamRecorder:
         save_type: str,
         script_command: str | None = None,
     ) -> bool:
-        """
-        The child process executes ffmpeg for recording
-        """
+        """The child process executes ffmpeg for recording"""
 
         logger.info(f"Starting ffmpeg recording - recorder id: {id(self)}, rec_id: {self.recording.rec_id}")
         self.should_stop = False
@@ -401,6 +394,14 @@ class LiveStreamRecorder:
             logger.info(f"Recording in Progress: {live_url}")
             logger.log("STREAM", f"Recording Stream URL: {record_url}")
             self.recording_start_time = time.time()
+            self._stats_file_path = save_file_path
+            self._stats_last_sample = None
+            self._stats_last_probe = 0.0
+            self._resolution_pending = True
+            try:
+                await self.update_stream_stats(None)
+            except Exception as e:
+                logger.debug(f"initial stream stats failed: {e}")
 
             while True:
                 if self.should_stop or self.recording.force_stop or not self.services.recording_enabled:
@@ -415,20 +416,15 @@ class LiveStreamRecorder:
                                 await asyncio.sleep(5)
                         else:
                             import signal
-
                             process.send_signal(signal.SIGINT)
-                            # process.terminate()
                             await asyncio.sleep(5)
-
                         if process.stdin:
                             process.stdin.close()
-
                         await asyncio.wait_for(process.wait(), timeout=15.0)
                     except asyncio.TimeoutError:
                         logger.warning(f"FFmpeg process did not exit gracefully, forcing termination: {live_url}")
                         process.kill()
                         await process.wait()
-
                     self.recording.force_stop = False
                     break
 
@@ -437,6 +433,14 @@ class LiveStreamRecorder:
                     await self.remove_active_recorder()
                     self.recording.is_recording = False
                     break
+
+                if time.time() - getattr(self, "_stats_last_probe", 0.0) >= self.STATS_INTERVAL:
+                    self._stats_last_probe = time.time()
+                    try:
+                        await self.update_stream_stats(None)
+                        self.services.broadcast_card_update(self.recording)
+                    except Exception as e:
+                        logger.debug(f"periodic stream stats failed: {e}")
 
                 await asyncio.sleep(1)
 
@@ -455,11 +459,9 @@ class LiveStreamRecorder:
             if return_code in safe_return_codes:
                 if not self.recording.is_recording:
                     await self._handle_recording_finished(record_name)
-
                 if not self.services.recording_enabled:
                     self.recording.status_info = RecordingStatus.NOT_RECORDING_SPACE
                     self.services.run_coro(self.stop_recording_notify())
-
                 if not self.recording.manually_stopped:
                     await self.recheck_live_status()
 
@@ -476,9 +478,7 @@ class LiveStreamRecorder:
                                     await self.converts_mp4(path, self.user_config["delete_original"])
                     else:
                         try:
-                            self.services.run_coro(
-                                self.converts_mp4(save_file_path, self.user_config["delete_original"])
-                            )
+                            self.services.run_coro(self.converts_mp4(save_file_path, self.user_config["delete_original"]))
                         except Exception as e:
                             logger.error(f"Failed to convert video: {e}")
                             await self.converts_mp4(save_file_path, self.user_config["delete_original"])
@@ -500,12 +500,8 @@ class LiveStreamRecorder:
                     except Exception as e:
                         logger.error(f"Failed to execute custom script: {e}")
                         await self.custom_script_execute(
-                            script_command,
-                            record_name,
-                            save_file_path,
-                            save_type,
-                            self.segment_record,
-                            self.user_config.get("convert_to_mp4"),
+                            script_command, record_name, save_file_path, save_type, self.segment_record,
+                            self.user_config.get("convert_to_mp4")
                         )
 
         except Exception as e:
@@ -526,17 +522,13 @@ class LiveStreamRecorder:
         return True
 
     async def converts_mp4(self, converts_file_path: str, is_original_delete: bool = True) -> None:
-        """Asynchronous transcoding method, can be added to the background service to continue execution"""
         if not self.services.recording_enabled:
             logger.info(f"Application is closing, adding transcoding task to background service: {converts_file_path}")
             BackgroundService.get_instance().add_task(self.converts_mp4_sync, converts_file_path, is_original_delete)
             return
-
-        # Otherwise, execute transcoding normally
         await self._do_converts_mp4(converts_file_path, is_original_delete)
 
     def converts_mp4_sync(self, converts_file_path: str, is_original_delete: bool = True) -> None:
-        """Synchronous version of the transcoding method, used for background service"""
         loop = asyncio.new_event_loop()
         asyncio.set_event_loop(loop)
         try:
@@ -545,7 +537,6 @@ class LiveStreamRecorder:
             loop.close()
 
     async def _do_converts_mp4(self, converts_file_path: str, is_original_delete: bool = True) -> None:
-        """Actual execution method for transcoding"""
         converts_success = False
         save_path = ""
         try:
@@ -553,16 +544,7 @@ class LiveStreamRecorder:
             if os.path.exists(converts_file_path) and os.path.getsize(converts_file_path) > 0:
                 save_path = converts_file_path.rsplit(".", maxsplit=1)[0] + ".mp4"
                 ffmpeg_command = [
-                    "ffmpeg",
-                    "-i",
-                    converts_file_path,
-                    "-c:v",
-                    "copy",
-                    "-c:a",
-                    "copy",
-                    "-f",
-                    "mp4",
-                    save_path,
+                    "ffmpeg", "-i", converts_file_path, "-c:v", "copy", "-c:a", "copy", "-f", "mp4", save_path,
                 ]
                 process = await asyncio.create_subprocess_exec(
                     *ffmpeg_command,
@@ -571,7 +553,6 @@ class LiveStreamRecorder:
                     stderr=asyncio.subprocess.PIPE,
                     startupinfo=self.subprocess_start_info,
                 )
-
                 self.services.process_manager.add_process(process)
                 task = asyncio.create_task(process.communicate())
                 _, stderr = await task
@@ -579,10 +560,7 @@ class LiveStreamRecorder:
                     converts_success = True
                     logger.info(f"Video transcoding completed: {save_path}")
                 else:
-                    logger.error(
-                        f"Video transcoding failed! Error message: {stderr.decode() if stderr else 'Unknown error'}"
-                    )
-
+                    logger.error(f"Video transcoding failed! Error message: {stderr.decode() if stderr else 'Unknown error'}")
         except subprocess.CalledProcessError as e:
             logger.error(f"Video transcoding failed! Error message: {e.output.decode()}")
 
@@ -598,7 +576,6 @@ class LiveStreamRecorder:
                     os.makedirs(converts_dir, exist_ok=True)
                     shutil.move(converts_file_path, converts_dir)
                     logger.info(f"Move Transcoding Files: {converts_file_path}")
-
         except subprocess.CalledProcessError as e:
             logger.error(f"Error occurred during conversion: {e}")
         except Exception as e:
@@ -632,17 +609,14 @@ class LiveStreamRecorder:
                 f"converts_to_mp4: {converts_to_mp4}",
             ]
         script_command = script_command.strip() + " " + " ".join(params)
-
         if not self.services.recording_enabled:
             logger.info("Application is closing, adding script execution task to background service")
             BackgroundService.get_instance().add_task(self.run_script_sync, script_command)
         else:
             self.services.run_coro(self.run_script_async(script_command))
-
         logger.success("Script command execution initiated!")
 
     def run_script_sync(self, command: str) -> None:
-        """Synchronous version of the script execution method, used for background service"""
         loop = asyncio.new_event_loop()
         asyncio.set_event_loop(loop)
         try:
@@ -659,22 +633,15 @@ class LiveStreamRecorder:
                 startupinfo=self.subprocess_start_info,
                 text=False,
             )
-
             stdout, stderr = await process.communicate()
-
             if stdout:
                 logger.info(stdout.splitlines()[0].decode())
             if stderr:
                 logger.error(stderr.splitlines()[0].decode())
-
             if process.returncode != 0:
                 logger.info(f"Custom Script process exited with return code {process.returncode}")
-
         except PermissionError:
-            logger.error(
-                "Script has no execution permission!, If it is a Linux environment, "
-                "please first execute: chmod+x your_script.sh to grant script executable permission"
-            )
+            logger.error("Script has no execution permission!, If it is a Linux environment, please first execute: chmod+x your_script.sh to grant script executable permission")
         except OSError:
             logger.error("Please add `#!/bin/bash` at the beginning of your bash script file.")
         except Exception as e:
@@ -706,9 +673,7 @@ class LiveStreamRecorder:
         save_type: str,
         script_command: str | None = None,
     ) -> bool:
-        """
-        Use the direct downloader to download the live stream
-        """
+        """Use the direct downloader to download the live stream"""
 
         logger.info(f"Starting direct download - recorder id: {id(self)}, rec_id: {self.recording.rec_id}")
         self.should_stop = False
@@ -732,7 +697,6 @@ class LiveStreamRecorder:
                     break
 
                 await asyncio.sleep(1)
-
                 if self.direct_downloader.download_task and self.direct_downloader.download_task.done():
                     break
 
@@ -773,7 +737,6 @@ class LiveStreamRecorder:
                     )
 
             return True
-
         except Exception as e:
             logger.error(f"Error occurred during direct download: {e}")
             self._handle_recording_error(record_name, self._["record_stream_error"])
@@ -793,13 +756,371 @@ class LiveStreamRecorder:
     async def end_message_push(self):
         msg_manager = message_pusher.MessagePusher(self.settings)
         user_config = self.settings.user_config
-
         if (
-            self.services.recording_enabled
-            and msg_manager.should_push_message(
-                self.settings, self.recording, check_manually_stopped=True, message_type="end"
+                self.services.recording_enabled
+                and msg_manager.should_push_message(
+                    self.settings, self.recording, check_manually_stopped=True, message_type="end"
+                )
+                and not self.recording.notified_live_end
+        ):
+            self.recording.notified_live_end = True
+            push_content = self._["push_content_end"]
+            end_push_message_text = user_config.get("custom_stream_end_content")
+            if end_push_message_text:
+                push_content = end_push_message_text
+
+            push_at = datetime.today().strftime("%Y-%m-%d %H:%M:%S")
+            push_content = (
+                push_content.replace("[room_name]", self.recording.streamer_name)
+                .replace("[time]", push_at)
+                .replace("[title]", self.recording.live_title or "None")
             )
-            and not self.recording.notified_live_end
+            msg_title = user_config.get("custom_notification_title").strip()
+            msg_title = msg_title or self._["status_notify"]
+
+            self.services.run_coro(msg_manager.push_messages(msg_title, push_content))
+
+    # ---------------- 录制统计：分辨率 / 帧率 / 源码率 / 写入速度 ----------------
+    STATS_INTERVAL = 10          # 录制过程中统计刷新间隔（秒）
+    _PROBE_TTL = 30              # 媒体探测缓存（秒）：本地读文件头，成本约 52ms/30ms CPU/449KB
+
+    async def update_stream_stats(self, stream_info):
+        """刷新录制统计：分辨率、帧率、源码率、写入速度。ffprobe 不随包分发，改为 m3u8/ffmpeg 探测。"""
+        url = ""
+        try:
+            url = (getattr(stream_info, "m3u8_url", None)
+                   or getattr(self, "_stats_source_url", "")
+                   or getattr(stream_info, "record_url", None)
+                   or getattr(self.recording, "record_url", "")
+                   or "")
+        except Exception:
+            url = getattr(self.recording, "record_url", "") or ""
+
+        try:
+            info = await self._probe_media(url)
+            if info.resolution:
+                self._stream_stats.res = info.resolution
+            self._stream_stats.fps = float(info.fps or 0.0)
+            self._stream_stats.bitrate = {"video": int(info.bitrate or 0)}
+            self._set_stream_preview(stream_info, info.resolution, info.fps, info.bitrate)
+        except Exception as e:
+            logger.debug(f"stream_stats probe error: {e}")
+
+        # 源码率每轮都刷新：只发一个小请求拿分片大小，成本可忽略
+        try:
+            live_bitrate = await self._probe_bitrate_live(url)
+            if live_bitrate > 0:
+                self._stream_stats.bitrate = {"video": int(live_bitrate)}
+        except Exception as e:
+            logger.debug(f"live bitrate probe error: {e}")
+
+        try:
+            speed = self._sample_write_speed()
+        except Exception as e:
+            logger.debug(f"stream_stats speed error: {e}")
+            speed = 0.0
+
+        speeds = self._stream_stats.last_write_speeds
+        speeds.append(speed)
+        del speeds[:-12]
+        self._stream_stats.write_speed = (sum(speeds) / len(speeds)) if speeds else 0.0
+        self._stream_stats.last_file_size = self._stats_last_size()
+
+        try:
+            payload = {
+                "video_fps": self._stream_stats.fps,
+                "source_bitrate": self._stream_stats.bitrate.get("video", 0),
+                "current_write_speed": round(speed, 2),
+                "speed": round(self._stream_stats.write_speed, 2),
+                "current_file_size": self._stream_stats.last_file_size,
+            }
+            # 分辨率只在本次录制第一次探测成功时写一次（换清晰度/重新开播会重置）
+            if getattr(self, "_resolution_pending", True) and self._stream_stats.res:
+                payload["video_resolution"] = self._stream_stats.res
+                self._resolution_pending = False
+            self.recording.update(payload)
+        except Exception as e:
+            logger.debug(f"stream_stats record update error: {e}")
+
+        snapshot = (self._stream_stats.res, self._stream_stats.fps,
+                    self._stream_stats.bitrate.get("video", 0), round(speed, 1))
+        if getattr(self, "_stats_last_logged", None) != snapshot:
+            self._stats_last_logged = snapshot
+            logger.debug(f"[STATS] {self.recording.streamer_name} res={snapshot[0]} fps={snapshot[1]} "
+                         f"bitrate={snapshot[2]}kbps write={speed:.1f}KB/s")
+
+    async def _probe_media(self, url: str) -> SimpleNamespace:
+        """优先解析 m3u8 属性，缺的再退回内置 ffmpeg 探测。"""
+        info = SimpleNamespace(resolution=None, fps=0.0, bitrate=0)
+        if not url:
+            return info
+
+        if not hasattr(self, "_probe_cache_data"):
+            self._probe_cache_data = {}
+        now = time.time()
+        hit = self._probe_cache_data.get(url)
+        if hit and now - hit[0] < self._PROBE_TTL:
+            return hit[1]
+
+        try:
+            if ".m3u8" in url.lower():
+                info = await self._probe_m3u8(url)
+        except Exception as e:
+            logger.debug(f"m3u8 probe failed: {e}")
+
+        if not info.resolution or info.fps <= 0:
+            # 本地录制文件已经在下盘了，读它不额外耗流量
+            try:
+                local_text = await self._probe_local_text()
+                if local_text:
+                    ff = self._parse_ffmpeg_probe(local_text)
+                    info.resolution = info.resolution or ff.resolution
+                    info.fps = info.fps or ff.fps
+                    info.bitrate = info.bitrate or ff.bitrate
+            except Exception as e:
+                logger.debug(f"local probe error: {e}")
+
+        if not info.resolution or info.fps <= 0:
+            try:
+                text = await self._probe_ffmpeg_text(url)
+                if text:
+                    ff = self._parse_ffmpeg_probe(text)
+                    info.resolution = info.resolution or ff.resolution
+                    info.fps = info.fps or ff.fps
+                    info.bitrate = info.bitrate or ff.bitrate
+            except Exception as e:
+                logger.debug(f"ffmpeg probe failed: {e}")
+
+        self._probe_cache_data[url] = (now, info)
+        return info
+
+    @staticmethod
+    def _fetch_text(url: str, timeout: int = 6, limit: int = 512 * 1024) -> str:
+        """只读取有限字节；直播流（FLV）是无限流，不能直接 read()。"""
+        req = urllib.request.Request(url, headers={"User-Agent": "Mozilla/5.0"})
+        with urllib.request.urlopen(req, timeout=timeout) as resp:
+            raw = resp.read(limit)
+        text = raw.decode("utf-8", errors="ignore")
+        return text if text.lstrip().startswith("#EXTM3U") else ""
+
+    async def _probe_m3u8(self, url: str) -> SimpleNamespace:
+        """master playlist 直接带 RESOLUTION/BANDWIDTH；抖音给的是 media playlist，按分片大小估算码率。"""
+        info = SimpleNamespace(resolution=None, fps=0.0, bitrate=0)
+        text = await asyncio.to_thread(self._fetch_text, url)
+        if not text:
+            return info
+        m = re.search(r"RESOLUTION=(\d{2,5})x(\d{2,5})", text)
+        if m:
+            info.resolution = m.group(1) + "x" + m.group(2)
+        m = re.search(r"FRAME-RATE=([\d.]+)", text)
+        if m:
+            info.fps = round(float(m.group(1)), 2)
+        m = re.search(r"AVERAGE-BANDWIDTH=(\d+)", text) or re.search(r"BANDWIDTH=(\d+)", text)
+        if m:
+            info.bitrate = int(m.group(1)) // 1000
+        if info.bitrate <= 0:
+            try:
+                info.bitrate = await asyncio.to_thread(self._segment_bitrate, text, url)
+            except Exception as e:
+                logger.debug(f"segment bitrate probe failed: {e}")
+        return info
+
+    @staticmethod
+    def _segment_bitrate(playlist_text: str, playlist_url: str, timeout: int = 6) -> int:
+        """用最后一个分片的 EXTINF 时长与字节数估算源码率（kbps）。"""
+        lines = [line.strip() for line in playlist_text.splitlines() if line.strip()]
+        duration = 0.0
+        uri = ""
+        for index, line in enumerate(lines):
+            if line.startswith("#EXTINF:"):
+                try:
+                    duration = float(line[len("#EXTINF:"):].split(",")[0])
+                except ValueError:
+                    duration = 0.0
+                for nxt in lines[index + 1:]:
+                    if not nxt.startswith("#"):
+                        uri = nxt
+                        break
+                break
+        if duration <= 0 or not uri:
+            return 0
+        segment_url = urllib.parse.urljoin(playlist_url, uri)
+        req = urllib.request.Request(
+            segment_url,
+            headers={"User-Agent": "Mozilla/5.0", "Range": "bytes=0-0"},
+        )
+        with urllib.request.urlopen(req, timeout=timeout) as resp:
+            size = 0
+            content_range = resp.headers.get("Content-Range") or ""
+            if "/" in content_range:
+                try:
+                    size = int(content_range.rsplit("/", 1)[1])
+                except ValueError:
+                    size = 0
+            if size <= 0:
+                size = int(resp.headers.get("Content-Length") or 0)
+            resp.read(1)
+        if size <= 1:
+            return 0
+        return int(size * 8 / 1000 / duration)
+
+    async def _probe_bitrate_live(self, url: str, timeout: int = 6) -> int:
+        """每轮都跑的轻量码率估算：取一次 playlist（约 1 KB）+ 分片 Range 请求（约 0.5 KB）。"""
+        if ".m3u8" not in url.lower():
+            return 0
+        text = await asyncio.to_thread(self._fetch_text, url)
+        if not text:
+            return 0
+        return await asyncio.to_thread(self._segment_bitrate, text, url)
+
+    async def _probe_ffmpeg_text(self, url: str) -> str:
+        ffmpeg_exe = shutil.which("ffmpeg") or "ffmpeg"
+        proc = await asyncio.create_subprocess_exec(
+            ffmpeg_exe, "-hide_banner", "-i", url,
+            stdin=asyncio.subprocess.DEVNULL,
+            stdout=asyncio.subprocess.DEVNULL,
+            stderr=asyncio.subprocess.PIPE,
+            startupinfo=self.subprocess_start_info,
+        )
+        try:
+            _, stderr = await asyncio.wait_for(proc.communicate(), timeout=15)
+        except asyncio.TimeoutError:
+            try:
+                proc.kill()
+            except Exception:
+                pass
+            return ""
+        return stderr.decode(errors="replace")
+
+    @staticmethod
+    def _parse_ffmpeg_probe(text: str) -> SimpleNamespace:
+        info = SimpleNamespace(resolution=None, fps=0.0, bitrate=0)
+        m = re.search(r"Video:.*?(\d{2,5})x(\d{2,5})", text)
+        if m:
+            info.resolution = m.group(1) + "x" + m.group(2)
+        m = re.search(r"([\d.]+)\s*fps", text) or re.search(r"([\d.]+)\s*tbr", text)
+        if m:
+            try:
+                info.fps = round(float(m.group(1)), 2)
+            except ValueError:
+                info.fps = 0.0
+        m = (re.search(r"Video:.*?(\d+)\s*kb/s", text)
+             or re.search(r"Stream #0:0.*?(\d+)\s*kb/s", text)
+             or re.search(r"bitrate:\s*(\d+)\s*kb/s", text))
+        if m:
+            info.bitrate = int(m.group(1))
+        return info
+
+    def _stats_current_files(self) -> list[str]:
+        """当前输出文件（分段录制返回同前缀的全部分片，按修改时间升序）。"""
+        path = getattr(self, "_stats_file_path", None)
+        if not path:
+            return []
+        try:
+            if "%" in path:
+                directory, name = os.path.split(path)
+                prefix = name.split("%")[0]
+                files = []
+                for entry in os.listdir(directory):
+                    if entry.startswith(prefix):
+                        files.append(os.path.join(directory, entry))
+                files.sort(key=lambda item: os.path.getmtime(item))
+                return files
+            return [path] if os.path.exists(path) else []
+        except OSError:
+            return []
+
+    def _stats_last_size(self) -> int:
+        """本次录制已写入的字节数（分段录制按同前缀分片求和）。"""
+        size = 0
+        for item in self._stats_current_files():
+            try:
+                size += os.path.getsize(item)
+            except OSError:
+                continue
+        return size
+
+    async def _probe_local_text(self) -> str:
+        """探测本地正在写的录制文件（只读磁盘、不走网络），拿分辨率/帧率。"""
+        files = self._stats_current_files()
+        if not files:
+            return ""
+        latest = files[-1]
+        try:
+            if os.path.getsize(latest) < 256 * 1024:
+                return ""
+        except OSError:
+            return ""
+        ffmpeg_exe = shutil.which("ffmpeg") or "ffmpeg"
+        try:
+            proc = await asyncio.create_subprocess_exec(
+                ffmpeg_exe, "-hide_banner", "-probesize", "200000", "-analyzeduration", "0", "-i", latest,
+                stdin=asyncio.subprocess.DEVNULL,
+                stdout=asyncio.subprocess.DEVNULL,
+                stderr=asyncio.subprocess.PIPE,
+                startupinfo=self.subprocess_start_info,
+            )
+            _, stderr = await asyncio.wait_for(proc.communicate(), timeout=10)
+            return stderr.decode(errors="replace")
+        except Exception as e:
+            logger.debug(f"local probe failed: {e}")
+            return ""
+
+    def _sample_write_speed(self) -> float:
+        """按文件大小增量计算写入速度（KB/s）。"""
+        now = time.time()
+        size = self._stats_last_size()
+        last = getattr(self, "_stats_last_sample", None)
+        self._stats_last_sample = (now, size)
+        if not last:
+            return 0.0
+        delta_t = now - last[0]
+        delta_b = size - last[1]
+        if delta_t <= 0 or delta_b < 0:
+            return 0.0
+        return round(delta_b / 1024 / delta_t, 2)
+
+    @property
+    def _stream_stats(self):
+        if not hasattr(self, "_stream_stats_data"):
+            self._stream_stats_data = SimpleNamespace(
+                fps=0.0,
+                write_speed=0.0,
+                bitrate={"video": 0},
+                last_write_speeds=[],
+                last_file_size=0,
+                res=None,
+            )
+        return self._stream_stats_data
+
+    def _set_stream_preview(self, stream_info, res, fps, bitrate):
+        if stream_info is None:
+            return
+        try:
+            stream_info.video_resolution = res
+            stream_info.video_fps = fps
+            stream_info.source_bitrate = bitrate
+        except Exception:
+            pass
+
+    async def stop_recording_notify(self):
+        if desktop_notify.should_push_notification(self.app):
+            tray_icon_path = self.services.tray_manager.icon_path if self.services.tray_manager is not None else ""
+            desktop_notify.send_notification(
+                title=self._["notify"],
+                message=self.recording.streamer_name + " | " + self._["live_recording_stopped_message"],
+                app_icon=tray_icon_path,
+            )
+
+    async def end_message_push(self):
+        msg_manager = message_pusher.MessagePusher(self.settings)
+        user_config = self.settings.user_config
+        if (
+                self.services.recording_enabled
+                and msg_manager.should_push_message(
+                    self.settings, self.recording, check_manually_stopped=True, message_type="end"
+                )
+                and not self.recording.notified_live_end
         ):
             self.recording.notified_live_end = True
             push_content = self._["push_content_end"]

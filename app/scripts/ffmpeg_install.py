@@ -8,7 +8,7 @@ from pathlib import Path
 
 import httpx
 
-from ..core.runtime.paths import user_data_dir
+from ..core.runtime.paths import EXECUTABLE_SUFFIX, resource_dir, user_data_dir
 from ..utils.logger import logger
 from ..utils.utils import get_startup_info
 
@@ -248,21 +248,51 @@ def update_env_path():
     os.environ["PATH"] = ffmpeg_env_path
 
 
-async def check_ffmpeg_installed() -> bool:
+def _bundled_ffmpeg_candidates() -> list[Path]:
+    """按优先级列出 ffmpeg 可执行文件：用户目录 -> 打包内置 (_internal/ffmpeg)。"""
+    exe_name = f"ffmpeg{EXECUTABLE_SUFFIX}"
+    candidates = [Path(ffmpeg_path) / exe_name]
+    bundled = Path(resource_dir) / "ffmpeg" / exe_name
+    if bundled.parent != Path(ffmpeg_path):
+        candidates.append(bundled)
+    return candidates
+
+
+def _probe_ffmpeg(command: str) -> str | None:
     try:
-        update_env_path()
-        result = subprocess.run(["ffmpeg", "-version"], capture_output=True, startupinfo=startupinfo, text=True)
-        version_info = result.stdout.strip()
-        if result.returncode == 0 and version_info:
-            logger.info(". ".join(version_info.splitlines()[:2]))
-            return True
-        else:
-            logger.debug(result.stderr.strip())
+        result = subprocess.run([command, "-version"], capture_output=True, startupinfo=startupinfo, text=True)
     except FileNotFoundError as e:
         logger.info(e)
+        return None
     except OSError as e:
         logger.error(f"OSError occurred: {e}.")
-        logger.error("Please delete the ffmpeg and try to download and install again.")
+        return None
     except Exception as e:
         logger.error(f"An unexpected error occurred: {e}")
+        return None
+    if result.returncode == 0 and result.stdout.strip():
+        return result.stdout.strip()
+    logger.debug((result.stderr or "").strip())
+    return None
+
+
+async def check_ffmpeg_installed() -> bool:
+    update_env_path()
+    version_info = _probe_ffmpeg("ffmpeg")
+    if version_info:
+        logger.info(". ".join(version_info.splitlines()[:2]))
+        return True
+
+    # PATH 里找不到时，直接探测打包内置的 ffmpeg，避免明明带了却误报「未安装」
+    for candidate in _bundled_ffmpeg_candidates():
+        if not candidate.is_file():
+            continue
+        version_info = _probe_ffmpeg(str(candidate))
+        if version_info:
+            os.environ["PATH"] = str(candidate.parent) + os.pathsep + os.environ.get("PATH", "")
+            logger.info(f"Using bundled ffmpeg: {candidate}")
+            logger.info(". ".join(version_info.splitlines()[:2]))
+            return True
+
+    logger.warning("ffmpeg is not installed.")
     return False

@@ -1,19 +1,16 @@
 # -*- mode: python ; coding: utf-8 -*-
-from PyInstaller.utils.hooks import collect_all
+from PyInstaller.utils.hooks import collect_data_files
 
-datas = []
-binaries = []
-hiddenimports = []
-tmp_ret = collect_all('flet')
-datas += tmp_ret[0]; binaries += tmp_ret[1]; hiddenimports += tmp_ret[2]
+datas = [('D:\\抖音\\修改\\StreamCap\\config', 'config'), ('D:\\抖音\\修改\\StreamCap\\locales', 'locales'), ('D:\\抖音\\修改\\StreamCap\\assets', 'assets'), ('D:\\抖音\\修改\\StreamCap\\vendor\\ffmpeg\\ffmpeg-2026-10-19-git-2344518cc5-essentials_build\\bin\\ffmpeg.exe', 'ffmpeg'), ('D:\\抖音\\修改\\StreamCap\\vendor\\node\\windows\\node.exe', 'node')]
+datas += collect_data_files('streamget')
 
 
 a = Analysis(
-    ['main.py'],
+    ['D:\\抖音\\修改\\StreamCap\\main.py'],
     pathex=[],
-    binaries=binaries,
+    binaries=[],
     datas=datas,
-    hiddenimports=hiddenimports,
+    hiddenimports=['pyexpat', '_multiprocessing', 'tzdata', 'plyer.platforms.win.notification'],
     hookspath=[],
     hooksconfig={},
     runtime_hooks=[],
@@ -39,6 +36,9 @@ exe = EXE(
     target_arch=None,
     codesign_identity=None,
     entitlements_file=None,
+    version='D:\\抖音\\修改\\StreamCap\\version_info.txt',
+    icon=['D:\\抖音\\修改\\StreamCap\\assets\\icon.ico'],
+    contents_directory='_internal',
 )
 coll = COLLECT(
     exe,

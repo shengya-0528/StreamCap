@@ -1,4 +1,6 @@
 import abc
+import shutil
+import subprocess
 
 DEFAULT_CONFIG = {
     "rw_timeout": "15000000",
@@ -20,6 +22,57 @@ FFMPEG_USER_AGENT = (
     "Mozilla/5.0 (Linux; Android 11; SAMSUNG SM-G973U) AppleWebKit/537.36 (KHTML, like Gecko) "
     "SamsungBrowser/14.2 Chrome/87.0.4280.141 Mobile Safari/537.36"
 )
+
+# FFmpeg 8.x 起 `-thread_queue_size` 被归到 muxer 一侧，放在 `-i` 之前会直接解析失败：
+#   Option thread_queue_size ... cannot be applied to input url ...
+# 老版本（<= 7.x）则只在输入侧生效。运行时探测一次，不支持的版本就不加这个参数。
+_INPUT_THREAD_QUEUE_SUPPORTED: bool | None = None
+
+
+def _supports_input_thread_queue_size() -> bool:
+    """判断当前 ffmpeg 是否接受放在 `-i` 之前的 `-thread_queue_size`。"""
+    global _INPUT_THREAD_QUEUE_SUPPORTED
+    if _INPUT_THREAD_QUEUE_SUPPORTED is not None:
+        return _INPUT_THREAD_QUEUE_SUPPORTED
+
+    supported = True
+    try:
+        binary = shutil.which("ffmpeg") or "ffmpeg"
+        result = subprocess.run(
+            [
+                binary,
+                "-hide_banner",
+                "-loglevel",
+                "error",
+                "-thread_queue_size",
+                "1024",
+                "-f",
+                "lavfi",
+                "-i",
+                "anullsrc",
+                "-t",
+                "0.1",
+                "-f",
+                "null",
+                "-",
+            ],
+            capture_output=True,
+            timeout=20,
+        )
+        text = (result.stderr or b"").decode("utf-8", "replace") + (
+            result.stdout or b""
+        ).decode("utf-8", "replace")
+        supported = "cannot be applied to input" not in text
+    except Exception:
+        # 探测失败就按老版本处理，保持原有行为
+        supported = True
+
+    _INPUT_THREAD_QUEUE_SUPPORTED = supported
+    return supported
+
+
+def _input_thread_queue_options() -> list[str]:
+    return ["-thread_queue_size", "1024"] if _supports_input_thread_queue_size() else []
 
 # HLS streams from these platforms may use media segment extensions that do
 # not match the container detected by FFmpeg.
@@ -92,7 +145,7 @@ class FFmpegCommandBuilder(abc.ABC):
             "-hide_banner",
             "-user_agent", FFMPEG_USER_AGENT,
             "-protocol_whitelist", "rtmp,crypto,file,http,https,tcp,tls,udp,rtp,httpproxy",
-            "-thread_queue_size", "1024",
+            *_input_thread_queue_options(),
             "-analyzeduration", config["analyzeduration"],
             "-probesize", config["probesize"],
             "-fflags", "+discardcorrupt+igndts",

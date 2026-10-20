@@ -47,6 +47,12 @@ class Recording:
         self.quality = quality
         self.record_format = record_format
         self.monitor_status = monitor_status
+        self.video_resolution = None
+        self.video_fps = 0.0
+        self.source_bitrate = 0
+        self.current_write_speed = 0
+        self.current_file_size = 0
+        self.speed = 0  # 最近一次实时写入速度（KB/s），供卡片与持久化兜底
         self.segment_record = segment_record
         self.segment_time = segment_time
         self.streamer_name = streamer_name
@@ -60,7 +66,6 @@ class Recording:
         self.video_bitrate = video_bitrate
         self.scheduled_time_range = None
         self.title = f"{streamer_name} - {self.quality}"
-        self.speed = "X KB/s"
         self.is_live = False
         self.is_recording = False
         self.start_time = None
@@ -114,6 +119,12 @@ class Recording:
             "fluctuation_retry_count": self.fluctuation_retry_count,
             "fluctuation_cumulative_wait": self.fluctuation_cumulative_wait,
             "fluctuation_cooldown_end_time": self.fluctuation_cooldown_end_time,
+            "video_resolution": self.video_resolution,
+            "video_fps": self.video_fps,
+            "source_bitrate": self.source_bitrate,
+            "current_write_speed": self.current_write_speed,
+            "current_file_size": self.current_file_size,
+            "speed": getattr(self, "speed", 0),
         }
 
     @classmethod
@@ -145,6 +156,7 @@ class Recording:
         if recording.last_duration_str is not None:
             recording.last_duration = timedelta(seconds=float(recording.last_duration_str))
         recording.fluctuation_cooldown_end_time = data.get("fluctuation_cooldown_end_time")
+        recording.speed = data.get("speed") or 0
         return recording
 
     def update_title(self, quality_info, prefix=None):

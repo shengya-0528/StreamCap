@@ -74,7 +74,8 @@ def bundled_ffmpeg_source(target_platform: str) -> Path:
     if target_platform == "macos":
         return VENDOR_DIR / "ffmpeg" / "macos" / "ffmpeg"
     if target_platform == "windows":
-        return VENDOR_DIR / "ffmpeg" / "windows" / "ffmpeg.exe"
+        # FFmpeg 已从 7z 解压到 vendor/ffmpeg/<git-tag>/，路径需对应实际解压目录
+        return VENDOR_DIR / "ffmpeg" / "ffmpeg-2026-10-19-git-2344518cc5-essentials_build" / "bin" / "ffmpeg.exe"
     raise ValueError(target_platform)
 
 

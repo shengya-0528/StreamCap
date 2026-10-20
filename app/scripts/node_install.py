@@ -10,7 +10,7 @@ from pathlib import Path
 import distro
 import httpx
 
-from ..core.runtime.paths import user_data_dir
+from ..core.runtime.paths import EXECUTABLE_SUFFIX, resource_dir, user_data_dir
 from ..utils.logger import logger
 from ..utils.utils import get_startup_info
 
@@ -226,14 +226,48 @@ def update_env_path():
     os.environ["PATH"] = node_env_path
 
 
-async def check_nodejs_installed() -> bool:
+def _bundled_node_candidates() -> list[Path]:
+    """按优先级列出 node 可执行文件：用户目录 -> 打包内置 (_internal/node)。"""
+    exe_name = f"node{EXECUTABLE_SUFFIX}"
+    candidates = [Path(node_path) / exe_name]
+    bundled = Path(resource_dir) / "node" / exe_name
+    if bundled.parent != Path(node_path):
+        candidates.append(bundled)
+    return candidates
+
+
+def _probe_node(command: str) -> str | None:
     try:
-        update_env_path()
-        result = subprocess.run(["node", "-v"], capture_output=True, startupinfo=startupinfo, text=True)
-        logger.info(result)
-        version_info = result.stdout.strip()
-        if result.returncode == 0 and version_info:
-            return True
+        result = subprocess.run([command, "-v"], capture_output=True, startupinfo=startupinfo, text=True)
     except FileNotFoundError as e:
         logger.info(e)
+        return None
+    except OSError as e:
+        logger.error(f"OSError occurred: {e}.")
+        return None
+    version_info = (result.stdout or "").strip()
+    if result.returncode == 0 and version_info:
+        return version_info
+    return None
+
+
+async def check_nodejs_installed() -> bool:
+    update_env_path()
+    version_info = _probe_node("node")
+    if version_info:
+        logger.info(f"node {version_info}")
+        return True
+
+    # PATH 里找不到时，直接探测打包内置的 node，避免误报「未安装」
+    for candidate in _bundled_node_candidates():
+        if not candidate.is_file():
+            continue
+        version_info = _probe_node(str(candidate))
+        if version_info:
+            os.environ["PATH"] = str(candidate.parent) + os.pathsep + os.environ.get("PATH", "")
+            logger.info(f"Using bundled node: {candidate}")
+            logger.info(f"node {version_info}")
+            return True
+
+    logger.warning("Node.js is not installed.")
     return False

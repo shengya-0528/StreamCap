@@ -1,8 +1,8 @@
 import asyncio
 import threading
+import time
 from collections import defaultdict
 from datetime import datetime, timedelta
-import time
 
 from ...messages import desktop_notify, message_pusher
 from ...models.recording.recording_model import Recording
@@ -11,7 +11,7 @@ from ...utils import utils
 from ...utils.logger import logger
 from ..platforms.platform_handlers import get_platform_info
 from ..runtime.process_manager import BackgroundService
-from .fluctuation_detector import FluctuationDetector, FluctuationMode
+from .fluctuation_detector import FluctuationDetector
 from .stream_manager import LiveStreamRecorder
 
 
@@ -74,9 +74,7 @@ class RecordingManager:
     def _init_fluctuation_detector(self, recording: Recording):
         """初始化或恢复某个录制任务对应的波动检测器。"""
         if recording.rec_id not in self.fluctuation_detectors:
-            self.fluctuation_detectors[recording.rec_id] = FluctuationDetector(
-                loop_time_seconds=self.loop_time_seconds
-            )
+            self.fluctuation_detectors[recording.rec_id] = FluctuationDetector(loop_time_seconds=self.loop_time_seconds)
         det = self.fluctuation_detectors[recording.rec_id]
         saved = getattr(recording, "fluctuation_retry_count", None)
         cumulative = getattr(recording, "fluctuation_cumulative_wait", None)
@@ -303,6 +301,14 @@ class RecordingManager:
 
         recording.manually_stopped = False
         if recording.is_recording or recording.stopping_in_progress:
+            if recording.is_recording and recording.rec_id in self.active_recorders:
+                recorder = self.active_recorders[recording.rec_id]
+                try:
+                    stream_info = await recorder.fetch_stream()
+                    if stream_info:
+                        await recorder.update_stream_stats(stream_info)
+                except Exception as e:
+                    logger.debug(f"update_stream_stats error: {e}")
             logger.debug(f"Skip check_if_live because recording is busy: {recording.url}")
             return
 

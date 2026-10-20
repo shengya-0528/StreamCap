@@ -4,11 +4,12 @@ from typing import Optional
 
 class FluctuationMode(Enum):
     """波动检测状态机：5 种状态"""
-    DETECTING = "detecting"       # 刚检测到中断，开始波动检测
-    RETRYING = "retrying"         # 指数退避重试中
+
+    DETECTING = "detecting"  # 刚检测到中断，开始波动检测
+    RETRYING = "retrying"  # 指数退避重试中
     CONFIRMED_DOWN = "confirmed_down"  # 累计等待达标，确认下播
-    LIVEDURING = "liveduring"     # 波动中检测到直播恢复
-    EXHAUSTED = "exhausted"       # 达到最大重试次数
+    LIVEDURING = "liveduring"  # 波动中检测到直播恢复
+    EXHAUSTED = "exhausted"  # 达到最大重试次数
 
 
 class FluctuationDetector:
@@ -44,17 +45,11 @@ class FluctuationDetector:
 
     def should_confirm_down(self) -> bool:
         """判断是否累计等待达标，可确认下播退出波动模式。"""
-        return (
-            self.cumulative_wait is not None
-            and self.cumulative_wait >= self.loop_time_seconds
-        )
+        return self.cumulative_wait is not None and self.cumulative_wait >= self.loop_time_seconds
 
     def should_give_up(self) -> bool:
         """判断是否达到最大重试次数，应放弃波动检测。"""
-        return (
-            self.current_retry is not None
-            and self.current_retry >= self.max_retries
-        )
+        return self.current_retry is not None and self.current_retry >= self.max_retries
 
     def next_retry(self) -> int:
         """推进一次重试，返回当前重试次数。"""

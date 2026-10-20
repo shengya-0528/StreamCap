@@ -52,9 +52,15 @@ class ConfigManager:
         self._init_config(self.default_config_path, default_config)
 
     def init_user_config(self):
-        if os.path.exists(self.user_config_path) and self.load_user_config():
-            return
-        shutil.copy(self.default_config_path, self.user_config_path)
+        filepath = os.path.join(self.config_path, "user_settings.json")
+        if os.path.exists(filepath):
+            try:
+                with open(filepath, encoding="utf-8") as f:
+                    json.load(f)
+                return
+            except (json.JSONDecodeError, OSError):
+                pass
+        shutil.copy(self.default_config_path, filepath)
 
     def init_cookies_config(self):
         cookies_config = {}
@@ -133,7 +139,6 @@ class ConfigManager:
                             f.write(content)
                         os.replace(tmp_path, config_path)
                     except BaseException:
-                        # Clean up temp file on failure.
                         try:
                             os.unlink(tmp_path)
                         except OSError:
