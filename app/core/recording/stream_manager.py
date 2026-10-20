@@ -783,6 +783,7 @@ class LiveStreamRecorder:
     # ---------------- 录制统计：分辨率 / 帧率 / 源码率 / 写入速度 ----------------
     STATS_INTERVAL = 10          # 录制过程中统计刷新间隔（秒）
     _PROBE_TTL = 30              # 媒体探测缓存（秒）：本地读文件头，成本约 52ms/30ms CPU/449KB
+    SPEED_WINDOW = 6             # 写入速度滑动窗口样本数：6 × 10s ≈ 1 分钟
 
     async def update_stream_stats(self, stream_info):
         """刷新录制统计：分辨率、帧率、源码率、写入速度。ffprobe 不随包分发，改为 m3u8/ffmpeg 探测。"""
@@ -822,7 +823,7 @@ class LiveStreamRecorder:
 
         speeds = self._stream_stats.last_write_speeds
         speeds.append(speed)
-        del speeds[:-12]
+        del speeds[:-self.SPEED_WINDOW]
         self._stream_stats.write_speed = (sum(speeds) / len(speeds)) if speeds else 0.0
         self._stream_stats.last_file_size = self._stats_last_size()
 
