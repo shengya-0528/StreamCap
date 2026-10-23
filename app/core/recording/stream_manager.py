@@ -159,7 +159,9 @@ class LiveStreamRecorder:
         cleaned_title = title[:30].replace("，", ",").replace(" ", "")
         return cleaned_title
 
-    def _handle_recording_error(self, record_name: str, error_msg: str, duration: int = 2000) -> None:
+    def _handle_recording_error(
+        self, record_name: str, error_msg: str, duration: int = 2000, trigger_fluctuation: bool = True
+    ) -> None:
         self.recording.status_info = RecordingStatus.RECORDING_ERROR
         try:
             self.services.recording_manager.stop_recording(self.recording)
@@ -168,6 +170,13 @@ class LiveStreamRecorder:
             self.services.broadcast_snack(record_name + " " + error_msg, duration=duration)
         except Exception as e:
             logger.debug(f"Failed to update UI: {e}")
+        # 录制异常退出同样算一次掉线，交给波动检测按节奏重试
+        if not trigger_fluctuation:
+            return
+        try:
+            self.services.recording_manager.trigger_fluctuation_detection(self.recording)
+        except Exception as e:
+            logger.debug(f"Failed to trigger fluctuation detection: {e}")
 
     async def _handle_recording_finished(self, record_name: str, stop_msg: str = "", complete_msg: str = "") -> None:
         self.recording.is_live = False
@@ -344,10 +353,17 @@ class LiveStreamRecorder:
         if not self.should_stop:
             recording_duration = time.time() - self.recording_start_time
             if recording_duration > self.min_valid_recording_duration:
-                if self.services.recording_enabled and not self.is_flv_preferred_platform:
+                if self.is_flv_preferred_platform:
+                    # 抖音/tiktok 等 FLV 平台：断流后交给波动检测判断是掉线还是真下播（第 1 次立即重试）
+                    if self.services.recording_manager.is_fluctuation_detection_enabled():
+                        self.services.recording_manager.trigger_fluctuation_detection(self.recording)
+                elif self.services.recording_enabled:
                     self.services.run_coro(self.services.recording_manager.check_if_live(self.recording))
             else:
                 self.recording.status_info = RecordingStatus.RECORDING_ERROR
+                self.services.broadcast_card_update(self.recording)
+                # 刚开录就断（ffmpeg 秒退）：按掉线处理，交给波动检测重试
+                self.services.recording_manager.trigger_fluctuation_detection(self.recording)
 
     @staticmethod
     async def _capture_stream_tail(stream, max_bytes: int = 64 * 1024) -> bytes:
@@ -506,7 +522,9 @@ class LiveStreamRecorder:
 
         except Exception as e:
             logger.error(f"An error occurred during the subprocess execution: {e}")
-            self._handle_recording_error(record_name, self._["no_ffmpeg_tip"], duration=4000)
+            self._handle_recording_error(
+                record_name, self._["no_ffmpeg_tip"], duration=4000, trigger_fluctuation=False
+            )
             return False
         finally:
             if process is not None and process.returncode is None:

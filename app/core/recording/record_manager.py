@@ -35,7 +35,8 @@ class RecordingManager:
         self.platform_semaphores = defaultdict(lambda: asyncio.Semaphore(max_concurrent))
         self.active_recorders = {}
         self.fluctuation_detectors = {}
-        self.fluctuation_detector = FluctuationDetector(loop_time_seconds=self.loop_time_seconds)
+        self._fluctuation_tasks = {}
+        self._fluctuation_cancelled = set()
 
     @property
     def app(self):
@@ -76,11 +77,14 @@ class RecordingManager:
         if recording.rec_id not in self.fluctuation_detectors:
             self.fluctuation_detectors[recording.rec_id] = FluctuationDetector(loop_time_seconds=self.loop_time_seconds)
         det = self.fluctuation_detectors[recording.rec_id]
+        # 用户可能改过检测周期，每轮都同步一次
+        det.loop_time_seconds = self.loop_time_seconds
         saved = getattr(recording, "fluctuation_retry_count", None)
         cumulative = getattr(recording, "fluctuation_cumulative_wait", None)
-        if saved is not None:
+        if saved is not None and not det.is_in_fluctuation():
             det.current_retry = saved
             det.cumulative_wait = cumulative
+        return det
 
     def _is_in_fluctuation_cooldown(self, recording: Recording) -> bool:
         """检查是否处于波动检测后的 7 分钟冷却期。"""
@@ -89,24 +93,154 @@ class RecordingManager:
             return False
         return datetime.now().timestamp() < cooldown_end
 
+    def is_fluctuation_detection_enabled(self) -> bool:
+        """波动检测总开关。"""
+        return bool(self.settings.user_config.get("fluctuation_detection_enabled", False))
+
+    def _save_fluctuation_state(self, recording: Recording, det: FluctuationDetector):
+        recording.fluctuation_retry_count = det.current_retry
+        recording.fluctuation_cumulative_wait = det.cumulative_wait
+
+    def _clear_fluctuation_state(self, recording: Recording, det: FluctuationDetector):
+        """退出波动模式：清空进度并把检测周期恢复成用户/默认设置。"""
+        det.reset()
+        recording.fluctuation_retry_count = None
+        recording.fluctuation_cumulative_wait = None
+        recording.loop_time_seconds = self.loop_time_seconds
+        self.services.run_coro(self.persist_recordings())
+
+    def _cancel_fluctuation_task(self, recording: Recording):
+        """取消重试循环并立即清空波动进度（用户手动停止 / 录制器报错接管时调用）。"""
+        self._fluctuation_cancelled.add(recording.rec_id)
+        task = self._fluctuation_tasks.pop(recording.rec_id, None)
+        det = self.fluctuation_detectors.get(recording.rec_id)
+        if det is not None:
+            det.reset()
+        recording.fluctuation_retry_count = None
+        recording.fluctuation_cumulative_wait = None
+        recording.loop_time_seconds = self.loop_time_seconds
+        if task is not None and not task.done():
+            logger.info(f"Cancelling fluctuation retry loop: {recording.title}")
+            try:
+                task.cancel()
+            except Exception:
+                pass
+
+    def trigger_fluctuation_detection(self, recording: Recording):
+        """录制器侧的公开入口：录制中断/异常时进入波动检测。"""
+        self._on_stream_offline(recording)
+
     def _on_stream_offline(self, recording: Recording):
-        """流掉线入口：按节奏表启动波动检测。"""
-        if not self.settings.user_config.get("fluctuation_detection_enabled", False):
+        """流掉线入口：按节奏表启动真正的波动检测重试调度。"""
+        if not self.is_fluctuation_detection_enabled():
             return
         # 冷却期未过，跳过波动检测
         if self._is_in_fluctuation_cooldown(recording):
+            logger.debug(f"Fluctuation skipped (in 7min cooldown): {recording.title}")
+            return
+        existing = self._fluctuation_tasks.get(recording.rec_id)
+        if existing is not None and not existing.done():
+            # 已有重试循环在跑，交给它推进节奏
             return
         det = self._init_fluctuation_detector(recording)
         if det.is_in_fluctuation():
             det.reset()
+        self._fluctuation_cancelled.discard(recording.rec_id)
         det.next_retry()
-        recording.fluctuation_retry_count = det.current_retry
-        recording.fluctuation_cumulative_wait = det.cumulative_wait
+        self._save_fluctuation_state(recording, det)
+        logger.info(
+            f"Fluctuation detected for {recording.title}: retry #{det.current_retry}, "
+            f"cumulative wait {det.cumulative_wait}s / {det.loop_time_seconds}s"
+        )
+        task = self.services.run_coro(self._fluctuation_retry_loop(recording))
+        if task is not None:
+            self._fluctuation_tasks[recording.rec_id] = task
 
-        # 确认下播或达到最大重试，进入冷却期
-        if det.should_confirm_down() or det.should_give_up():
-            recording.fluctuation_cooldown_end_time = time.time() + 7 * 60
-            det.reset()
+    async def _fluctuation_retry_loop(self, recording: Recording):
+        """波动检测调度循环：按 0/5/15/30/45/60+30k 秒重试，一轮走完仍未恢复才判下播。"""
+        det = self._init_fluctuation_detector(recording)
+        try:
+            while True:
+                if recording.rec_id in self._fluctuation_cancelled:
+                    self._fluctuation_cancelled.discard(recording.rec_id)
+                    logger.info(f"Fluctuation retry loop cancelled: {recording.title}")
+                    self._clear_fluctuation_state(recording, det)
+                    return
+                # 一轮走完（3 分钟周期第 10 次 / 1 分钟周期第 6 次）仍未恢复 → 确认下播。
+                # 放在 sleep 之前判断：确认下播不必再白等一个节奏周期。
+                if det.should_give_up() or det.should_confirm_round():
+                    self._confirm_fluctuation_down(recording, det)
+                    return
+
+                wait = det.get_retry_wait(det.current_retry or 1)
+                if wait > 0:
+                    logger.info(f"Fluctuation retry #{det.current_retry} for {recording.title}: wait {wait}s")
+                    await asyncio.sleep(wait)
+
+                if not self.services.recording_enabled or not recording.monitor_status:
+                    logger.info(f"Fluctuation aborted (recording disabled or monitor stopped): {recording.title}")
+                    self._clear_fluctuation_state(recording, det)
+                    return
+
+                # 其他路径（周期检测/手动刷新）已经把录制拉起来了
+                if recording.is_recording and recording.is_live:
+                    logger.success(f"Fluctuation recovered before retry #{det.current_retry}: {recording.title}")
+                    self._clear_fluctuation_state(recording, det)
+                    return
+
+                await self.force_restart_recording(recording)
+                # 给录制器留出真正起来的时间，再判定是否恢复
+                await asyncio.sleep(8)
+
+                if recording.is_recording and recording.is_live:
+                    logger.success(f"Fluctuation recovered after retry #{det.current_retry}: {recording.title}")
+                    self._clear_fluctuation_state(recording, det)
+                    return
+
+                det.next_retry()
+                self._save_fluctuation_state(recording, det)
+                logger.info(
+                    f"Fluctuation retry #{det.current_retry - 1} failed for {recording.title}, "
+                    f"cumulative wait {det.cumulative_wait}s"
+                )
+        except asyncio.CancelledError:
+            # 字段已在 _cancel_fluctuation_task 同步清理；这里不能再动，否则会覆盖接管的新循环
+            self._fluctuation_cancelled.discard(recording.rec_id)
+            raise
+        except Exception as e:
+            logger.error(f"Fluctuation retry loop error for {recording.title}: {e}")
+        finally:
+            self._fluctuation_tasks.pop(recording.rec_id, None)
+
+    async def force_restart_recording(self, recording: Recording) -> bool:
+        """等价于用户点「录制」按钮：清理残留状态后重新检测直播并拉起录制。"""
+        try:
+            recording.stopping_in_progress = False
+            recording.manually_stopped = False
+            recording.force_stop = False
+            recording.stop_requested = False
+            if not recording.is_recording and recording.rec_id in self.active_recorders:
+                logger.debug(f"Dropping stale recorder before retry: {recording.rec_id}")
+                self.active_recorders.pop(recording.rec_id, None)
+            recording.is_recording = False
+            await self.check_if_live(recording)
+            return recording.is_recording
+        except Exception as e:
+            logger.error(f"Force restart recording failed for {recording.title}: {e}")
+            return False
+
+    def _confirm_fluctuation_down(self, recording: Recording, det: FluctuationDetector):
+        """一轮波动走完仍未恢复：确认主播下播，进入 7 分钟冷却后恢复默认检测周期。"""
+        recording.fluctuation_cooldown_end_time = time.time() + 7 * 60
+        logger.info(
+            f"Fluctuation confirmed offline for {recording.title}: {det.current_retry} retries, "
+            f"cumulative wait {det.cumulative_wait}s. Cooldown 7min, restore check period {self.loop_time_seconds}s"
+        )
+        self._clear_fluctuation_state(recording, det)
+        recording.detection_time = None
+        self.services.broadcast_card_update(recording)
+        self.services.broadcast_pubsub("update", recording)
+
 
     async def add_recording(self, recording):
         with GlobalRecordingState.lock:
@@ -257,6 +391,10 @@ class RecordingManager:
         """Check the live status of all recordings and update their display titles."""
         for recording in self.recordings:
             if recording.monitor_status and not recording.is_recording:
+                # 该任务正由波动检测调度，避免周期检测与重试循环并发拉起两个录制器
+                det = self.fluctuation_detectors.get(recording.rec_id)
+                if det is not None and det.is_in_fluctuation():
+                    continue
                 is_exceeded = utils.is_time_interval_exceeded(recording.detection_time, recording.loop_time_seconds)
                 if not recording.detection_time or is_exceeded:
                     self.services.run_coro(self.check_if_live(recording))
@@ -455,14 +593,16 @@ class RecordingManager:
                 recording.status_info = RecordingStatus.LIVE_BROADCASTING
 
         else:
+            was_streaming = recording.is_live or recording.is_recording
             recording.is_recording = False
             if recording.is_live:
                 recording.is_live = False
                 asyncio.create_task(recorder.end_message_push())
 
             recording.status_info = RecordingStatus.MONITORING
-            # 波动检测掉线入口
-            self._on_stream_offline(recording)
+            # 只有「原本在播/在录」才算掉线，交给波动检测判断是真下播还是网络波动
+            if was_streaming:
+                self._on_stream_offline(recording)
             title = f"{stream_info.anchor_name or recording.streamer_name} - {self._[recording.quality]}"
             if recording.streamer_name == self._["live_room"] or f"[{self._['is_live']}]" in recording.display_title:
                 recording.update(
@@ -496,6 +636,8 @@ class RecordingManager:
 
     def stop_recording(self, recording: Recording, manually_stopped: bool = True):
         """Stop the recording process."""
+        if manually_stopped:
+            self._cancel_fluctuation_task(recording)
         recording.is_live = False
         if recording.is_recording:
             recording.stopping_in_progress = True

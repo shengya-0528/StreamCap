@@ -39,6 +39,14 @@ class FluctuationDetector:
         """返回前 n 次累计等待时长（秒）。"""
         return sum(self.get_retry_wait(i) for i in range(1, n + 1))
 
+    def expected_retries(self) -> int:
+        """按当前检测周期推算「一轮」应有的重试次数：3 分钟→10 次，1 分钟→6 次。"""
+        try:
+            cycles = round(int(self.loop_time_seconds) / 18)
+        except (TypeError, ValueError):
+            cycles = 10
+        return max(6, cycles)
+
     def is_in_fluctuation(self) -> bool:
         """判断是否在波动检测中。"""
         return self.current_retry is not None
@@ -47,9 +55,19 @@ class FluctuationDetector:
         """判断是否累计等待达标，可确认下播退出波动模式。"""
         return self.cumulative_wait is not None and self.cumulative_wait >= self.loop_time_seconds
 
+    def should_confirm_round(self) -> bool:
+        """判断是否走完一整轮波动检测：累计等待达标 且 重试次数达到该周期应有轮数。
+
+        默认 3 分钟周期下第 10 次、1 分钟周期下第 6 次正好完成一轮；
+        一轮仍未恢复才确认主播下播，避免误判。
+        """
+        if self.current_retry is None or self.cumulative_wait is None:
+            return False
+        return self.cumulative_wait >= self.loop_time_seconds and self.current_retry >= self.expected_retries()
+
     def should_give_up(self) -> bool:
         """判断是否达到最大重试次数，应放弃波动检测。"""
-        return self.current_retry is not None and self.current_retry >= self.max_retries
+        return self.current_retry is not None and self.current_retry >= max(self.max_retries, self.expected_retries())
 
     def next_retry(self) -> int:
         """推进一次重试，返回当前重试次数。"""
